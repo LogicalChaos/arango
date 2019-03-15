@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -45,16 +46,20 @@ func main() {
 	_, _, _ = fileobjects.EnsureHashIndex(nil, []string{"name"}, nil)
 	_, _, _ = directories.EnsureHashIndex(nil, []string{"path"}, nil)
 
-	commandPtr := flag.String("cmd", "", "clean|scan|count")
+	commandPtr := flag.String("cmd", "", "truncate|clean|scan|count")
 	pathPtr := flag.String("path", "./", "path to command")
+	prefixPtr := flag.String("prefix", "", "Prefix to add to each scan, like '/neo/scan1'")
 	flag.Parse()
 
+	root := filepath.Join(*prefixPtr, *pathPtr)
 	switch *commandPtr {
 	case "clean":
-		deleteDirectoryRecursive(*pathPtr)
-		//_ = edges.Truncate(nil)
-		//_ = directories.Truncate(nil)
-		//_ = fileobjects.Truncate(nil)
+		deleteDirectoryRecursive(root)
+		break
+	case "truncate":
+		_ = edges.Truncate(nil)
+		_ = directories.Truncate(nil)
+		_ = fileobjects.Truncate(nil)
 		break
 	case "scan":
 		ds := GetDirectoryServer()
@@ -62,11 +67,23 @@ func main() {
 		defer ds.Stop()
 		channel := ds.GetFileHandlerPayloadChannel()
 
-		err := filepath.Walk(*pathPtr, func(path string, info os.FileInfo, err error) error {
+		info, err := os.Stat(*pathPtr)
+		if err != nil {
+			log.Fatalf("could not stat %v: %v", *pathPtr, err)
+		}
+		if len(*prefixPtr) > 0 {
+			path := "/"
+			pathElements := strings.Split(root, string(filepath.Separator))
+			for _, element := range pathElements[1:] {
+				path = filepath.Join(path, element)
+				processDirectoryPayload(ds, FileHandlerPayload{info, path})
+			}
+		}
+		err = filepath.Walk(*pathPtr, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
 				return err
 			}
-			channel <- FileHandlerPayload{info, path}
+			channel <- FileHandlerPayload{info, filepath.Join(*prefixPtr, path)}
 			return nil
 		})
 		if err != nil {
@@ -79,9 +96,11 @@ func main() {
 		break
 	case "count":
 		categories := NewCategories()
-		fillCategories(*pathPtr, categories)
+		fillCategories(root, categories)
 		_, _ = spew.Println(categories.CategoriesDto)
 		break
+	default:
+		log.Fatalf("unrecognized command: %v", *commandPtr)
 	}
 }
 
@@ -266,4 +285,25 @@ func deleteDirectoryRecursive(root string) {
 			continue
 		}
 	}
+}
+
+func getEdge(edge Contains) (driver.DocumentMeta, error) {
+	query := "FOR e IN contains FILTER e._from == @from AND e._to == @to RETURN e"
+	bindVars := map[string]interface{}{"from": edge.From, "to": edge.To}
+	cursor, err := db.Query(nil, query, bindVars)
+	if err != nil {
+		return driver.DocumentMeta{}, fmt.Errorf("failed querying edge %v: %v", edge, err)
+	}
+	defer func() { _ = cursor.Close() }()
+	contains := Contains{}
+
+	if !cursor.HasMore() {
+		return driver.DocumentMeta{}, fmt.Errorf("no edge %v", edge)
+	}
+
+	meta, err := cursor.ReadDocument(nil, &contains)
+	if err != nil {
+		return driver.DocumentMeta{}, fmt.Errorf("failed reading cursor: %v", err)
+	}
+	return meta, nil
 }

@@ -150,19 +150,25 @@ func processFilePayload(ds *DirectoryServer, filePayload FileHandlerPayload) {
 func processDirectoryPayload(ds *DirectoryServer, filePayload FileHandlerPayload) {
 	ds.totalDirectoriesProcessed++
 
-	currentDirectory := Directory{Path: filePayload.FullPath}
-	currentDirectoryMeta, err := directories.CreateDocument(nil, currentDirectory)
+	currentDirectory, currentDirectoryMeta, err := getDirectory(filePayload.FullPath)
 	if err != nil {
-		log.Printf("failed creating  directory %#v: %v\n", currentDirectory, err)
-		return
+		currentDirectory = Directory{Path: filePayload.FullPath}
+		currentDirectoryMeta, err = directories.CreateDocument(nil, currentDirectory)
+		if err != nil {
+			log.Printf("failed creating  directory %#v: %v\n", currentDirectory, err)
+			return
+		}
 	}
 
 	_, parentDirectoryMeta, err := getDirectory(filepath.Dir(filePayload.FullPath))
 	if err == nil {
 		edge := Contains{"directories/" + parentDirectoryMeta.Key, "directories/" + currentDirectoryMeta.Key}
-		_, err = edges.CreateDocument(nil, edge)
+		_, err := getEdge(edge)
 		if err != nil {
-			log.Printf("failed creating edge %#v: %v\n", edge, err)
+			_, err = edges.CreateDocument(nil, edge)
+			if err != nil {
+				log.Printf("failed creating edge %#v: %v\n", edge, err)
+			}
 		}
 	}
 }

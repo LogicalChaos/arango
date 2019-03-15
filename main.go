@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/arangodb/go-driver"
 	"github.com/arangodb/go-driver/http"
+	"github.com/davecgh/go-spew/spew"
 	"log"
 	"os"
 	"path/filepath"
@@ -44,7 +45,7 @@ func main() {
 	_, _, _ = fileobjects.EnsureHashIndex(nil, []string{"name"}, nil)
 	_, _, _ = directories.EnsureHashIndex(nil, []string{"path"}, nil)
 
-	commandPtr := flag.String("cmd", "", "clean|parse|count")
+	commandPtr := flag.String("cmd", "", "clean|scan|count")
 	pathPtr := flag.String("path", "./", "path to command")
 	flag.Parse()
 
@@ -55,7 +56,7 @@ func main() {
 		//_ = directories.Truncate(nil)
 		//_ = fileobjects.Truncate(nil)
 		break
-	case "parse":
+	case "scan":
 		ds := GetDirectoryServer()
 		ds.Start()
 		defer ds.Stop()
@@ -77,8 +78,44 @@ func main() {
 		}
 		break
 	case "count":
+		categories := NewCategories()
+		fillCategories(*pathPtr, categories)
+		_, _ = spew.Println(categories.CategoriesDto)
 		break
 	}
+}
+
+func fillCategories(root string, categories *Categories) {
+	filesFound := uint64(0)
+	_, meta, err := getDirectory(root)
+	if err != nil {
+		log.Fatalf("failed querying directory %v: %v", root, err)
+	}
+
+	query := "FOR v IN 0..10000 OUTBOUND @start GRAPH 'contains' FILTER IS_SAME_COLLECTION('fileobjects', v) RETURN v"
+	bindVars := map[string]interface{}{"start": meta.ID}
+	cursor, err := db.Query(nil, query, bindVars)
+	if err != nil {
+		log.Fatalf("failed querying graph starting at %v: %v", root, err)
+	}
+	defer func() {
+		err := cursor.Close()
+		if err != nil {
+			log.Printf("failed to close graph iterator: %v\n", err)
+		}
+	}()
+
+	file := File{}
+	for cursor.HasMore() {
+		filesFound++
+		_, err := cursor.ReadDocument(nil, &file)
+		if err != nil {
+			log.Printf("failed to read cursor: %v\n", err)
+			continue
+		}
+		categories.CategorizeFile(&file.Modified, file.FileSize)
+	}
+	fmt.Printf("Found %d files\n", filesFound)
 }
 
 func setupVertexCollection(name string) driver.Collection {

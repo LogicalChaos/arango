@@ -2,9 +2,12 @@ package main
 
 import (
 	"fmt"
+	"github.com/arangodb/go-driver"
+	"github.com/karlseguin/ccache"
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 )
@@ -26,6 +29,7 @@ type FileHandlerPayload struct {
  */
 type DirectoryServer struct {
 	fileHandlerChannel        chan FileHandlerPayload
+	filePayloadChannel        chan FileHandlerPayload
 	stopChannel               chan struct{}
 	running                   bool
 	m                         sync.Mutex
@@ -40,12 +44,19 @@ type DirectoryServer struct {
 var (
 	directoryServerInstance *DirectoryServer
 	directoryServerOnce     sync.Once
+	ParallelFilePayload     int
+	lruDirectoryCache       = ccache.New(ccache.Configure())
 )
+
+func init() {
+	ParallelFilePayload = 5 * runtime.NumCPU() / 6
+}
 
 func GetDirectoryServer() *DirectoryServer {
 	directoryServerOnce.Do(func() {
 		directoryServerInstance = &DirectoryServer{
 			fileHandlerChannel:        make(chan FileHandlerPayload, ChannelSize),
+			filePayloadChannel:        make(chan FileHandlerPayload, ParallelFilePayload*10),
 			stopChannel:               make(chan struct{}),
 			running:                   false,
 			lastEmittedUpdateTime:     time.Now(),
@@ -65,6 +76,9 @@ func (ds *DirectoryServer) Start() {
 	if !ds.running {
 		ds.running = true
 		go listen(ds)
+		for i := 0; i < ParallelFilePayload; i++ {
+			go processFilePayload(ds)
+		}
 		return
 	}
 }
@@ -95,7 +109,7 @@ func listen(ds *DirectoryServer) {
 			if filePayload.FileInfo.IsDir() {
 				processDirectoryPayload(ds, filePayload)
 			} else {
-				processFilePayload(ds, filePayload)
+				ds.filePayloadChannel <- filePayload
 			}
 			logUpdateIfNecessary(ds, filePayload, channelElements)
 		case <-ds.stopChannel:
@@ -119,36 +133,52 @@ func logUpdateIfNecessary(ds *DirectoryServer, filePayload FileHandlerPayload, c
 	}
 }
 
-func processFilePayload(ds *DirectoryServer, filePayload FileHandlerPayload) {
-	ds.totalFilesProcessed++
-	ds.filesProcessed++
+func processFilePayload(ds *DirectoryServer) {
 
-	parentDirectory, parentDirectoryMeta, err := getDirectory(filepath.Dir(filePayload.FullPath))
-	if err != nil {
-		parentDirectory = Directory{Path: filepath.Dir(filePayload.FullPath)}
-		parentDirectoryMeta, err = directories.CreateDocument(nil, parentDirectory)
+	for {
+		filePayload := <-ds.filePayloadChannel
+		ds.m.Lock()
+		ds.totalFilesProcessed++
+		ds.filesProcessed++
+		ds.m.Unlock()
+
+		var parentDirectoryMeta driver.DocumentMeta
+		value := lruDirectoryCache.Get(filePayload.FullPath)
+		if value == nil {
+			var parentDirectory Directory
+			var err error
+			parentDirectory, parentDirectoryMeta, err = getDirectory(filepath.Dir(filePayload.FullPath))
+			if err != nil {
+				parentDirectory = Directory{Path: filepath.Dir(filePayload.FullPath)}
+				parentDirectoryMeta, err = directories.CreateDocument(nil, parentDirectory)
+				if err != nil {
+					log.Printf("failed creating parent directory %#v: %v\n", parentDirectory, err)
+					return
+				}
+			}
+			lruDirectoryCache.Set(filePayload.FullPath, &parentDirectoryMeta, time.Hour*24)
+		} else {
+			parentDirectoryMeta = *(value.Value().(*driver.DocumentMeta))
+		}
+
+		file := File{Name: filePayload.FullPath, FileSize: filePayload.FileInfo.Size(), Modified: filePayload.FileInfo.ModTime()}
+		fileMeta, err := fileobjects.CreateDocument(nil, file)
 		if err != nil {
-			log.Printf("failed creating parent directory %#v: %v\n", parentDirectory, err)
+			log.Printf("failed creating file %v: %v\n", file, err)
 			return
 		}
-	}
-
-	file := File{Name: filePayload.FullPath, FileSize: filePayload.FileInfo.Size(), Modified: filePayload.FileInfo.ModTime()}
-	fileMeta, err := fileobjects.CreateDocument(nil, file)
-	if err != nil {
-		log.Printf("failed creating file %v: %v\n", file, err)
-		return
-	}
-	edge := Contains{"directories/" + parentDirectoryMeta.Key, "fileobjects/" + fileMeta.Key}
-	_, err = edges.CreateDocument(nil, edge)
-	if err != nil {
-		log.Printf("failed creating edge %#v: %v\n", edge, err)
-		return
+		edge := Contains{"directories/" + parentDirectoryMeta.Key, "fileobjects/" + fileMeta.Key}
+		_, err = edges.CreateDocument(nil, edge)
+		if err != nil {
+			log.Printf("failed creating edge %#v: %v\n", edge, err)
+			return
+		}
 	}
 }
 
 func processDirectoryPayload(ds *DirectoryServer, filePayload FileHandlerPayload) {
 	ds.totalDirectoriesProcessed++
+	created := false
 
 	currentDirectory, currentDirectoryMeta, err := getDirectory(filePayload.FullPath)
 	if err != nil {
@@ -158,10 +188,21 @@ func processDirectoryPayload(ds *DirectoryServer, filePayload FileHandlerPayload
 			log.Printf("failed creating  directory %#v: %v\n", currentDirectory, err)
 			return
 		}
+		created = true
+	}
+	lruDirectoryCache.Set(filePayload.FullPath, &currentDirectoryMeta, time.Hour*24)
+
+	var parentDirectoryMeta driver.DocumentMeta
+	parent := filepath.Dir(filePayload.FullPath)
+
+	value := lruDirectoryCache.Get(parent)
+	if value == nil {
+		_, parentDirectoryMeta, err = getDirectory(parent)
+	} else {
+		parentDirectoryMeta = *(value.Value().(*driver.DocumentMeta))
 	}
 
-	_, parentDirectoryMeta, err := getDirectory(filepath.Dir(filePayload.FullPath))
-	if err == nil {
+	if created && err == nil {
 		edge := Contains{"directories/" + parentDirectoryMeta.Key, "directories/" + currentDirectoryMeta.Key}
 		_, err := getEdge(edge)
 		if err != nil {

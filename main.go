@@ -48,6 +48,8 @@ func main() {
 
 	commandPtr := flag.String("cmd", "", "truncate|clean|scan|count")
 	pathPtr := flag.String("path", "./", "path to command")
+	countPtr := flag.Int("count", 0, "run loop, adds a 3 digit suffix to prefix, only on scan")
+	startPtr := flag.Int("start", 0, "start of loop counter, only used with count")
 	prefixPtr := flag.String("prefix", "", "Prefix to add to each scan, like '/neo/scan1'")
 	flag.Parse()
 
@@ -71,23 +73,38 @@ func main() {
 		if err != nil {
 			log.Fatalf("could not stat %v: %v", *pathPtr, err)
 		}
-		if len(*prefixPtr) > 0 {
-			path := "/"
-			pathElements := strings.Split(root, string(filepath.Separator))
-			for _, element := range pathElements[1:] {
-				path = filepath.Join(path, element)
-				processDirectoryPayload(ds, FileHandlerPayload{info, path})
+
+		loop := 1
+		prefixer := func(x int) string { return *prefixPtr }
+		if *countPtr > 0 {
+			loop = *countPtr
+			prefixer = func(x int) string {
+				newPrefix := fmt.Sprintf("%s%03d", *prefixPtr, x+*startPtr)
+				root = filepath.Join(newPrefix, *pathPtr)
+				return newPrefix
 			}
 		}
-		err = filepath.Walk(*pathPtr, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return err
+
+		for i := 0; i < loop; i++ {
+			prefix := prefixer(i)
+			if len(prefix) > 0 {
+				path := "/"
+				pathElements := strings.Split(root, string(filepath.Separator))
+				for _, element := range pathElements[1:] {
+					path = filepath.Join(path, element)
+					processDirectoryPayload(ds, FileHandlerPayload{info, path})
+				}
 			}
-			channel <- FileHandlerPayload{info, filepath.Join(*prefixPtr, path)}
-			return nil
-		})
-		if err != nil {
-			log.Fatalf("error walking directory: %v", err)
+			err = filepath.Walk(*pathPtr, func(path string, info os.FileInfo, err error) error {
+				if err != nil {
+					return err
+				}
+				channel <- FileHandlerPayload{info, filepath.Join(prefix, path)}
+				return nil
+			})
+			if err != nil {
+				log.Fatalf("error walking directory: %v", err)
+			}
 		}
 
 		for len(channel) > 0 {
